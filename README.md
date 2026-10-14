@@ -9,12 +9,15 @@ input queues (by priority) ──► TenantScheduler ──► output queues (by
 
 - jobs are taken from one or several input queues (a lower `priority` value is more urgent);
 - the output queue is chosen by job name (`nameToQueue`);
-- a job is moved to the output queue only when the system has free `capacity`
+- a job is moved to the output queue only when the system has a free `capacity` slot
   (jobs waiting/active/delayed in output queues) and its tenant has free quota;
-- a tenant never has more than its quota of jobs in flight or buffered: surplus jobs are
-  returned to the input queue as delayed (`quotaDelay`, default 1s) and retried later,
-  so one tenant with thousands of jobs cannot hide the others;
-- between tenants the slots are shared fairly (the tenant with the fewest jobs in flight goes first).
+- otherwise the job goes back to its input queue as delayed (`quotaDelay` / `capacityDelay`,
+  growing up to `maxDelay`, with jitter) and is retried later. A tenant with thousands of jobs
+  therefore holds at most its quota of slots and never hides the other tenants.
+
+Slots are kept in Redis (Lua scripts), so **any number of schedulers can run in parallel**
+(other processes/hosts) and share `capacity` and quotas, as long as they use the same
+`name` (default `'default'`), `prefix` and Redis.
 
 ```ts
 import { TenantScheduler } from 'bullmq-tenant'
@@ -42,6 +45,10 @@ tenant id (`data.tenantId` by default); jobs without tenant or route fail perman
 ## Notes
 
 - Delivery is at-least-once. The output job id is `<inputQueue>-<inputJobId>`, so a re-delivered input job is not duplicated.
-- `lookahead` (default 500 per input queue) only bounds the buffer; since a tenant holds at most its quota there, it should be at least the sum of quotas of concurrently active tenants.
+- A slot is reserved, the job is added to the output queue, the slot is confirmed. If a scheduler dies in between, the reservation expires after `leaseTime` (30s).
+- A slot is freed by the `completed`/`failed`/`removed` events of the output queue; a periodic reconcile (`reconcileInterval`, 30s, one scheduler at a time) frees the slots of jobs whose event was missed.
+- Priorities and fairness between tenants when the global `capacity` is exhausted are approximate: there is no shared pending list, a free slot goes to the job that retries first. Less urgent input queues retry less often (delay is multiplied by `1 + rank of priority`). The tenant quota is strict.
+- Retries cost Redis round trips: a large backlog of one tenant is polled every `quotaDelay`..`maxDelay`; tune the delays to your load.
+- Input workers only reserve slots, their `concurrency` (default 100) limits parallel reservations.
 - `delay` of an input job is applied by the input queue and is not forwarded.
-- On start the scheduler counts jobs that are already in the output queues.
+- Jobs that are already in the output queues when the first scheduler starts are not counted (no adoption); run with an empty namespace or let them finish first.

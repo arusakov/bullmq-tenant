@@ -1,5 +1,5 @@
-export { Allocator } from './allocator.js'
-export type { AllocatorItem, AllocatorOptions } from './allocator.js'
+export { Slots } from './slots.js'
+export type { ReserveOptions, ReserveResult, ScriptRunner } from './slots.js'
 export { TenantScheduler } from './scheduler.js'
 export type {
   DefaultJob,

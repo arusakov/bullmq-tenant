@@ -7,6 +7,8 @@ import { Queue, Worker, type Job } from 'bullmq'
 
 import { TenantScheduler } from './scheduler.js'
 import type { TenantSchedulerOptions } from './scheduler.js'
+import { Slots } from './slots.js'
+import type { ScriptRunner } from './slots.js'
 
 const connection = {
   host: process.env['REDIS_HOST'] ?? 'localhost',
@@ -41,7 +43,7 @@ const create = (
     outputsConfig,
     { connection, prefix },
     routes,
-    options,
+    { name: randomUUID(), ...options },
   )
   s.on('error', (error) => assert.fail(error))
   return s
@@ -132,19 +134,19 @@ describe('TenantScheduler', () => {
     const inQ = queue(input)
     const outQ = queue(out)
 
-    const s = await scheduler([input], { work: out }, { capacity: 2 })
+    const s = await scheduler([input], { work: out }, { capacity: 2, quotas: { default: 10 }, capacityDelay: 50 })
 
     await inQ.addBulk(Array.from({ length: 6 }, (_, i) => ({ name: 'work', data: { tenantId: 't', i } })))
 
     await until(async () => (await inQ.getCompletedCount()) === 2)
     await sleep(200)
     assert.equal(await outQ.getWaitingCount(), 2)
-    assert.equal(s.inFlight, 2)
+    assert.equal(await s.inFlight(), 2)
 
     let done = 0
     consumer(out, async () => void done++)
     await until(() => done === 6)
-    assert.equal(await inQ.getCompletedCount(), 6)
+    await until(async () => (await inQ.getCompletedCount()) === 6)
   })
 
   test('applies tenant quotas', async () => {
@@ -166,15 +168,15 @@ describe('TenantScheduler', () => {
     const jobs = await outQ.getJobs(['waiting'])
     const tenants = jobs.map((job) => job.data.tenantId as string).sort()
     assert.deepEqual(tenants, ['a', 'b', 'b', 'b'])
-    assert.equal(s.inFlightOf('a'), 1)
-    assert.equal(s.inFlightOf('b'), 3)
+    assert.equal(await s.inFlightOf('a'), 1)
+    assert.equal(await s.inFlightOf('b'), 3)
 
     let done = 0
     consumer(out, async () => void done++)
     await until(() => done === 6)
   })
 
-  test('delays surplus jobs of a tenant so others are not hidden', async () => {
+  test('surplus jobs of a tenant are delayed and do not hide other tenants', async () => {
     const input = name('in')
     const out = name('out')
     const inQ = queue(input)
@@ -183,7 +185,7 @@ describe('TenantScheduler', () => {
     const s = await scheduler(
       [input],
       { work: out },
-      { capacity: 10, quotas: { default: 2 }, lookahead: 3, quotaDelay: 60_000 },
+      { capacity: 10, quotas: { default: 2 }, quotaDelay: 60_000 },
     )
 
     await inQ.addBulk([
@@ -192,12 +194,35 @@ describe('TenantScheduler', () => {
     ])
 
     await until(async () => (await outQ.getWaitingCount()) === 3)
-    assert.equal(s.inFlightOf('a'), 2)
-    assert.equal(s.inFlightOf('b'), 1)
+    assert.equal(await s.inFlightOf('a'), 2)
+    assert.equal(await s.inFlightOf('b'), 1)
     assert.equal(await inQ.getDelayedCount(), 18)
   })
 
-  test('processes more urgent input queue first', async () => {
+  test('schedulers with the same name share capacity and quotas', async () => {
+    const input = name('in')
+    const out = name('out')
+    const inQ = queue(input)
+    const outQ = queue(out)
+    const options = { capacity: 3, quotas: { default: 2 }, name: name('shared'), quotaDelay: 60_000, capacityDelay: 60_000 }
+
+    const first = await scheduler([input], { work: out }, options)
+    await scheduler([input], { work: out }, options)
+
+    await inQ.addBulk([
+      ...Array.from({ length: 10 }, () => ({ name: 'work', data: { tenantId: 'a' } })),
+      ...Array.from({ length: 10 }, () => ({ name: 'work', data: { tenantId: 'b' } })),
+    ])
+
+    await until(async () => (await outQ.getWaitingCount()) === 3)
+    await sleep(300)
+    assert.equal(await outQ.getWaitingCount(), 3)
+    assert.equal(await first.inFlight(), 3)
+    assert.ok((await first.inFlightOf('a')) <= 2)
+    assert.ok((await first.inFlightOf('b')) <= 2)
+  })
+
+  test('less urgent input queue retries later', async () => {
     const high = name('high')
     const low = name('low')
     const out = name('out')
@@ -205,21 +230,21 @@ describe('TenantScheduler', () => {
     const lowQ = queue(low)
     const outQ = queue(out)
 
-    const s = await scheduler(
+    await scheduler(
       [
         { name: low, priority: 10 },
         { name: high, priority: 1 },
       ],
       { work: out },
-      { capacity: 1, quotas: { default: 10 } },
+      { capacity: 1, quotas: { default: 10 }, capacityDelay: 150, maxDelay: 2000 },
     )
 
-    // occupy the only slot, then buffer low before high
+    // occupy the only slot, then queue low before high
     await lowQ.add('work', { tenantId: 't', label: 'blocker' })
     await until(async () => (await outQ.getWaitingCount()) === 1)
     await lowQ.add('work', { tenantId: 't', label: 'low' })
     await highQ.add('work', { tenantId: 't', label: 'high' })
-    await until(() => s.pending === 2)
+    await until(async () => (await highQ.getDelayedCount()) + (await lowQ.getDelayedCount()) === 2)
 
     const order: string[] = []
     consumer(out, async (job) => void order.push(job.data.label))
@@ -233,7 +258,7 @@ describe('TenantScheduler', () => {
     const inQ = queue(input)
     queue(out)
 
-    await scheduler([input], { work: out }, { capacity: 1 })
+    await scheduler([input], { work: out }, { capacity: 1, capacityDelay: 50 })
 
     await inQ.add('work', { tenantId: 't', label: 'x' }, { attempts: 2, backoff: 300 })
     await inQ.add('work', { tenantId: 't', label: 'y' })
@@ -252,23 +277,23 @@ describe('TenantScheduler', () => {
     assert.deepEqual(log, ['x', 'x', 'y'])
   })
 
-  test('close returns buffered jobs to the input queue', async () => {
+  test('reconcile releases slots of jobs that no longer exist', async () => {
     const input = name('in')
     const out = name('out')
-    const inQ = queue(input)
-    queue(out)
+    queue(input)
+    const outQ = queue(out)
 
-    const s = create([input], { work: out }, { capacity: 1, quotas: { default: 10 } })
-    await s.waitUntilReady()
-    s.run()
+    const options = { capacity: 1, reconcileInterval: 100, name: name('rec') }
+    const s = await scheduler([input], { work: out }, options)
+    const slots = new Slots(
+      (await outQ.getBackend().client) as unknown as ScriptRunner,
+      // same base the scheduler uses
+      `${prefix}:{tenant-scheduler:${options.name}}`,
+    )
+    await slots.reserve({ tenant: 't', key: `${out}:ghost`, capacity: 1, quota: 1, leaseMs: 60_000 })
+    await slots.confirm('t', `${out}:ghost`)
+    assert.equal(await s.inFlight(), 1)
 
-    await inQ.addBulk(Array.from({ length: 3 }, () => ({ name: 'work', data: { tenantId: 't' } })))
-    await until(() => s.pending === 2)
-
-    await s.close()
-
-    assert.equal(await inQ.getWaitingCount(), 2)
-    assert.equal(await inQ.getCompletedCount(), 1)
-    assert.equal(await inQ.getFailedCount(), 0)
+    await until(async () => (await s.inFlight()) === 0)
   })
 })

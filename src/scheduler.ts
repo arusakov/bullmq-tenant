@@ -16,8 +16,8 @@ import type {
   WorkerOptions,
 } from 'bullmq'
 
-import { Allocator } from './allocator.js'
-import type { AllocatorItem } from './allocator.js'
+import { Slots } from './slots.js'
+import type { ScriptRunner } from './slots.js'
 
 /** Connection (and key prefix) shared by all input and output queues. */
 export type SchedulerQueueOptions = Pick<QueueOptions, 'connection' | 'prefix'>
@@ -44,6 +44,7 @@ export type TenantSchedulerOptions<JN extends string = string> = {
   /**
    * Max number of jobs in the output queues (waiting + active + delayed)
    * at the same time, i.e. the throughput of the whole system.
+   * Shared by all schedulers with the same `name`, `prefix` and Redis.
    */
   capacity: number
   quotas?: {
@@ -52,29 +53,32 @@ export type TenantSchedulerOptions<JN extends string = string> = {
     /** Per-tenant overrides. */
     tenants?: Record<string, number>
   }
+  /**
+   * Schedulers with the same name (and prefix, Redis) run in parallel and
+   * share capacity and quotas. Default: 'default'.
+   */
+  name?: string
   /** Extracts tenant id from a job. Default: `job.data.tenantId`. */
   tenantOf?: (job: Job<any, any, JN>) => string | number | undefined | null
-  /**
-   * How many jobs per input queue the scheduler may hold in memory.
-   * A tenant never has more than its quota of jobs here, so the window is
-   * not clogged by one tenant. Default: 500.
-   */
-  lookahead?: number
-  /**
-   * Delay (ms) before a job of a tenant that has used up its quota is
-   * retried: it goes back to the input queue as delayed. Default: 1000.
-   */
-  quotaDelay?: number
   /** Last chance to change a job before it is added to the output queue. */
   prepareJob?: (job: DefaultJob<JN>) => DefaultJob<JN>
-}
-
-type Pending = {
-  job: Job
-  token: string | undefined
-  outputName: string
-  resolve: () => void
-  reject: (error: Error) => void
+  /**
+   * A job that cannot get a slot goes back to its input queue as delayed.
+   * Base delay (ms) when the tenant has used up its quota. Default: 1000.
+   */
+  quotaDelay?: number
+  /** Base delay (ms) when the global capacity is used up. Default: 500. */
+  capacityDelay?: number
+  /**
+   * Delays grow by 1.5x with every attempt up to this limit (ms) and are
+   * multiplied by (1 + rank of the input queue priority), so less urgent
+   * queues retry less often. Default: 10000.
+   */
+  maxDelay?: number
+  /** How long (ms) a reserved slot is kept if the scheduler dies before adding the job. Default: 30000. */
+  leaseTime?: number
+  /** How often (ms) slots of finished/removed jobs whose event was missed are released. Default: 30000. */
+  reconcileInterval?: number
 }
 
 const FORWARDED_OPTIONS = [
@@ -94,10 +98,14 @@ const PREPARE_JOB_DEFAULT = <J>(job: J) => job
 /**
  * Sits between input queues and output queues.
  *
- * Jobs are taken from the input queues, buffered, and moved to the output
- * queue chosen by job name only when the system has free capacity and the
- * job's tenant has free quota. Output queues are consumed by ordinary BullMQ
- * workers (e.g. `WorkerManager` from bullmq-toolkit).
+ * A job is taken from an input queue and moved to the output queue chosen by
+ * job name only when the system has free capacity and the job's tenant has
+ * free quota. Otherwise it goes back to the input queue as delayed and is
+ * retried later, so a tenant with a huge backlog never blocks the others.
+ *
+ * Slots are kept in Redis, so any number of schedulers (processes) with the
+ * same `name` can run in parallel and share the limits. Output queues are
+ * consumed by ordinary BullMQ workers (e.g. `WorkerManager` from bullmq-toolkit).
  *
  * Emits 'error' (like BullMQ workers do); attach a listener.
  */
@@ -110,16 +118,19 @@ export class TenantScheduler<
   protected readonly queues = {} as Record<ONs, Queue>
   protected readonly events = {} as Record<ONs, QueueEvents>
   protected readonly priorities = {} as Record<INs, number>
-  protected readonly allocator: Allocator<Pending>
+  /** Index of the input queue priority among all priorities: 0 = most urgent. */
+  protected readonly ranks = {} as Record<INs, number>
   protected readonly prepareJob: NonNullable<TenantSchedulerOptions<JNs>['prepareJob']>
   protected readonly tenantOf: NonNullable<TenantSchedulerOptions<JNs>['tenantOf']>
+  protected slots!: Slots
+  protected reconciler: NodeJS.Timeout | undefined
   protected connected = false
   protected closing = false
 
   constructor(
     inputsConfig: Inputs<INs>,
     outputsConfig: Outputs<ONs>,
-    queueOptions: SchedulerQueueOptions,
+    protected queueOptions: SchedulerQueueOptions,
     protected nameToQueue: NameToQueue<JNs, ONs>,
     protected options: TenantSchedulerOptions<JNs>,
   ) {
@@ -129,11 +140,6 @@ export class TenantScheduler<
       throw new RangeError('capacity must be a positive number')
     }
 
-    const { quotas } = options
-    this.allocator = new Allocator<Pending>({
-      capacity: options.capacity,
-      quota: (tenant) => quotas?.tenants?.[tenant] ?? quotas?.default ?? options.capacity,
-    })
     this.prepareJob = options.prepareJob ?? PREPARE_JOB_DEFAULT
     this.tenantOf = options.tenantOf ?? ((job) => job.data?.tenantId)
 
@@ -150,9 +156,7 @@ export class TenantScheduler<
       })
       events.on('error', (error) => this.emit('error', error))
       const release = ({ jobId }: { jobId: string }) => {
-        if (this.allocator.release(`${name}:${jobId}`)) {
-          this.pump()
-        }
+        this.slots?.release(`${name}:${jobId}`).catch((error) => this.emit('error', error))
       }
       // 'failed' is emitted only when attempts are exhausted, retries keep the slot
       events.on('completed', release)
@@ -177,7 +181,7 @@ export class TenantScheduler<
         (job, token) => this.accept(name as INs, job, token),
         {
           ...queueOptions,
-          concurrency: options.lookahead ?? 500,
+          concurrency: 100,
           ...workerOptions,
           autorun: false,
         },
@@ -189,20 +193,22 @@ export class TenantScheduler<
     if (Object.keys(this.workers).length === 0) {
       throw new RangeError('at least one input queue is required')
     }
+
+    const levels = [...new Set(Object.values<number>(this.priorities))].sort((a, b) => a - b)
+    for (const [name, priority] of Object.entries<number>(this.priorities)) {
+      this.ranks[name as INs] = levels.indexOf(priority)
+    }
   }
 
-  /** Number of jobs buffered and waiting for a free slot. */
-  get pending() {
-    return this.allocator.pendingSize
+  /** Number of jobs dispatched to the output queues and not finished yet (all schedulers). */
+  async inFlight() {
+    this.checkConnected()
+    return this.slots.size()
   }
 
-  /** Number of jobs dispatched to the output queues and not finished yet. */
-  get inFlight() {
-    return this.allocator.inFlightSize
-  }
-
-  inFlightOf(tenant: string) {
-    return this.allocator.inFlightOf(tenant)
+  async inFlightOf(tenant: string) {
+    this.checkConnected()
+    return this.slots.sizeOf(tenant)
   }
 
   async waitUntilReady() {
@@ -216,16 +222,9 @@ export class TenantScheduler<
       ...this.getInputWorkers().map((worker) => worker.waitUntilReady()),
     ])
 
-    // account for jobs that are already in the output queues (restart)
-    for (const [name, queue] of Object.entries<Queue>(this.queues)) {
-      const jobs = await queue.getJobs(['waiting', 'active', 'delayed', 'prioritized'])
-      for (const job of jobs) {
-        const tenant = this.tenantKey(job)
-        if (tenant !== undefined && job.id !== undefined) {
-          this.allocator.acquire(`${name}:${job.id}`, tenant)
-        }
-      }
-    }
+    const client = (await this.getOutputQueues()[0]!.getBackend().client) as unknown as ScriptRunner
+    const prefix = this.queueOptions.prefix ?? 'bull'
+    this.slots = new Slots(client, `${prefix}:{tenant-scheduler:${this.options.name ?? 'default'}}`)
 
     this.connected = true
     return true
@@ -240,32 +239,24 @@ export class TenantScheduler<
         void worker.run()
       }
     }
+
+    const interval = this.options.reconcileInterval ?? 30_000
+    this.reconciler ??= setInterval(() => {
+      this.reconcile(interval).catch((error) => this.emit('error', error))
+    }, interval)
+    this.reconciler.unref()
   }
 
   /**
-   * Stops the scheduler. Buffered jobs are returned to their input queues,
-   * jobs already dispatched stay in the output queues.
+   * Stops the scheduler. Jobs already dispatched stay in the output queues,
+   * their slots stay reserved until they finish.
    */
   async close() {
     if (this.closing) {
       return false
     }
     this.closing = true
-
-    // stop fetching first, otherwise returned jobs are picked up again at once
-    await Promise.all(this.getInputWorkers().map((worker) => worker.pause(true)))
-
-    const buffered = this.allocator.drain()
-    await Promise.all(
-      buffered.map(async ({ value }) => {
-        try {
-          await value.job.moveToWait(value.token)
-          value.reject(new WaitingError())
-        } catch (error) {
-          value.reject(error as Error)
-        }
-      }),
-    )
+    clearInterval(this.reconciler)
 
     await Promise.all(this.getInputWorkers().map((worker) => worker.close()))
     await Promise.all(this.getEvents().map((events) => events.close()))
@@ -298,79 +289,86 @@ export class TenantScheduler<
     return Object.values<QueueEvents>(this.events)
   }
 
-  protected accept(inputName: INs, job: Job, token: string | undefined) {
+  protected async accept(inputName: INs, job: Job, token: string | undefined) {
     const tenant = this.tenantKey(job)
     if (tenant === undefined) {
       throw new UnrecoverableError(`Job ${job.id} has no tenant id`)
     }
 
     const outputName = this.getQueueNameByJobName(job.name as JNs)
-    if (outputName === undefined || !this.queues[outputName]) {
+    const queue = outputName === undefined ? undefined : this.queues[outputName]
+    if (outputName === undefined || !queue) {
       throw new UnrecoverableError(`No output queue for job name "${job.name}"`)
     }
 
-    if (this.closing) {
-      return job.moveToWait(token).then(() => {
-        throw new WaitingError()
-      })
-    }
+    const jobId = this.outputJobId(inputName, job)
+    const key = `${outputName}:${jobId}`
 
-    // the tenant has used up its quota (in flight + buffered): do not hold
-    // the job in memory, retry it later, so other tenants stay visible
-    if (this.allocator.loadOf(tenant) >= this.allocator.quotaOf(tenant)) {
-      return job
-        .moveToDelayed(Date.now() + (this.options.quotaDelay ?? 1000), token)
-        .then(() => {
-          throw new DelayedError()
-        })
-    }
-
-    return new Promise<void>((resolve, reject) => {
-      this.allocator.push({
-        key: `${outputName}:${this.outputJobId(inputName, job)}`,
-        tenant,
-        priority: this.priorities[inputName],
-        value: { job, token, outputName, resolve, reject },
-      })
-      this.pump()
+    const { quotas } = this.options
+    const reserved = await this.slots.reserve({
+      tenant,
+      key,
+      capacity: this.options.capacity,
+      quota: quotas?.tenants?.[tenant] ?? quotas?.default ?? this.options.capacity,
+      leaseMs: this.options.leaseTime ?? 30_000,
     })
-  }
 
-  protected pump() {
-    if (this.closing) {
-      return
+    if (reserved === 'held') {
+      return // already dispatched (input job was delivered twice)
     }
-    for (let item = this.allocator.take(); item; item = this.allocator.take()) {
-      void this.dispatch(item)
+    if (reserved !== 'reserved') {
+      const base = reserved === 'quota' ? this.options.quotaDelay ?? 1000 : this.options.capacityDelay ?? 500
+      await job.moveToDelayed(Date.now() + this.delayFor(base, inputName, job), token)
+      throw new DelayedError()
     }
-  }
-
-  protected async dispatch(item: AllocatorItem<Pending>) {
-    const { job, outputName, resolve, reject } = item.value
-    const queue = this.queues[outputName as ONs]
-    const jobId = item.key.slice(outputName.length + 1)
 
     try {
       // the same input job can be delivered twice (stalled, crash after add)
-      const existing = await queue.getJob(jobId)
-      if (existing) {
-        this.allocator.release(item.key)
-      } else {
-        const opts: JobsOptions = { jobId }
-        for (const name of FORWARDED_OPTIONS) {
-          if (job.opts[name] !== undefined) {
-            Object.assign(opts, { [name]: job.opts[name] })
-          }
-        }
-        const prepared = this.prepareJob({ name: job.name as JNs, data: job.data, opts })
-        await queue.add(prepared.name, prepared.data, prepared.opts)
+      if (await queue.getJob(jobId)) {
+        await this.slots.release(key)
+        return
       }
-      resolve()
+
+      const opts: JobsOptions = { jobId }
+      for (const name of FORWARDED_OPTIONS) {
+        if (job.opts[name] !== undefined) {
+          Object.assign(opts, { [name]: job.opts[name] })
+        }
+      }
+      const prepared = this.prepareJob({ name: job.name as JNs, data: job.data, opts })
+      await queue.add(prepared.name, prepared.data, prepared.opts)
+      await this.slots.confirm(tenant, key)
     } catch (error) {
-      this.allocator.release(item.key)
-      reject(error as Error)
+      await this.slots.release(key).catch(() => undefined)
+      throw error
     }
-    this.pump()
+  }
+
+  protected delayFor(base: number, inputName: INs, job: Job) {
+    const attempt = Math.min(job.attemptsStarted || 1, 20)
+    const delay = Math.min(
+      base * (1 + this.ranks[inputName]) * 1.5 ** (attempt - 1),
+      this.options.maxDelay ?? 10_000,
+    )
+    return Math.round(delay * (0.8 + Math.random() * 0.4))
+  }
+
+  /** Releases slots of jobs that finished or were removed while no scheduler listened. */
+  protected async reconcile(interval: number) {
+    if (this.closing || !(await this.slots.lock('reconcile', interval))) {
+      return
+    }
+    for (const key of await this.slots.confirmed()) {
+      const separator = key.indexOf(':')
+      const queue = this.queues[key.slice(0, separator) as ONs]
+      if (!queue) {
+        continue // dispatched by a scheduler with other output queues
+      }
+      const state = await queue.getJobState(key.slice(separator + 1))
+      if (state === 'completed' || state === 'failed' || state === 'unknown') {
+        await this.slots.release(key)
+      }
+    }
   }
 
   /** Input queues have independent id sequences, so the id must be qualified. */
