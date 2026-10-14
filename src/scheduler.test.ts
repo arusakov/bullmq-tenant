@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { afterEach, describe, test } from 'node:test'
+import { afterEach, before, describe, test } from 'node:test'
 import { setTimeout as sleep } from 'node:timers/promises'
 
 import { Queue, Worker, type Job } from 'bullmq'
@@ -9,6 +9,7 @@ import { TenantScheduler } from './scheduler.js'
 import type { TenantSchedulerOptions } from './scheduler.js'
 import { Slots } from './slots.js'
 import type { ScriptRunner } from './slots.js'
+import { disablePersistence } from './test-utils.js'
 
 const connection = {
   host: process.env['REDIS_HOST'] ?? 'localhost',
@@ -78,6 +79,8 @@ const until = async (predicate: () => boolean | Promise<boolean>, timeout = 5000
 }
 
 const name = (label: string) => `${label}-${randomUUID().slice(0, 8)}`
+
+before(() => disablePersistence(connection))
 
 afterEach(async () => {
   for (const close of closers.splice(0).reverse()) {

@@ -1,16 +1,18 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { after, describe, test } from 'node:test'
+import { after, before, describe, test } from 'node:test'
 import { setTimeout as sleep } from 'node:timers/promises'
 
 import { Redis } from 'ioredis'
 
 import { Slots } from './slots.js'
+import { disablePersistence } from './test-utils.js'
 
-const client = new Redis({
+const options = {
   host: process.env['REDIS_HOST'] ?? 'localhost',
   port: Number(process.env['REDIS_PORT'] ?? 6379),
-})
+}
+const client = new Redis(options)
 const bases: string[] = []
 
 const slots = () => {
@@ -21,6 +23,8 @@ const slots = () => {
 
 const reserve = (s: Slots, key: string, tenant = 't', capacity = 10, quota = 10, leaseMs = 10_000) =>
   s.reserve({ tenant, key, capacity, quota, leaseMs })
+
+before(() => disablePersistence(options))
 
 after(async () => {
   for (const base of bases) {
