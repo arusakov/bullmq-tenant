@@ -1,0 +1,6 @@
+{
+  "all": true,
+  "src": ["src"],
+  "include": ["dist/**/*.js"],
+  "exclude": ["dist/**/*.test.js"]
+}
