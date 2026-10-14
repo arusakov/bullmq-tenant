@@ -81,6 +81,39 @@ export type TenantSchedulerOptions<JN extends string = string> = {
   reconcileInterval?: number
 }
 
+export type DispatchedEvent = {
+  tenant: string
+  inputQueue: string
+  outputQueue: string
+  /** Id of the job in the input queue. */
+  jobId: string | undefined
+  /** Id of the job in the output queue. */
+  outputJobId: string
+}
+
+export type DelayedEvent = Omit<DispatchedEvent, 'outputJobId'> & {
+  /** `quota`: the tenant has no free quota, `capacity`: the system has no free capacity. */
+  reason: 'quota' | 'capacity'
+  /** ms before the job is checked again. */
+  delay: number
+}
+
+export type ReleasedEvent = {
+  outputQueue: string
+  /** Id of the job in the output queue. */
+  outputJobId: string
+}
+
+export type SchedulerEvents = {
+  /** A job was moved to an output queue. */
+  dispatched: [DispatchedEvent]
+  /** A job got no slot and went back to its input queue as delayed. */
+  delayed: [DelayedEvent]
+  /** A job in an output queue finished (or was removed) and its slot was freed. */
+  released: [ReleasedEvent]
+  error: [Error]
+}
+
 const FORWARDED_OPTIONS = [
   'attempts',
   'backoff',
@@ -107,13 +140,14 @@ const PREPARE_JOB_DEFAULT = <J>(job: J) => job
  * same `name` can run in parallel and share the limits. Output queues are
  * consumed by ordinary BullMQ workers (e.g. `WorkerManager` from bullmq-toolkit).
  *
- * Emits 'error' (like BullMQ workers do); attach a listener.
+ * Emits 'dispatched', 'delayed' and 'released' (see `SchedulerEvents`), e.g. for
+ * logging and metrics. Emits 'error' (like BullMQ workers do); attach a listener.
  */
 export class TenantScheduler<
   JNs extends string,
   INs extends string,
   ONs extends string,
-> extends EventEmitter {
+> extends EventEmitter<SchedulerEvents> {
   protected readonly workers = {} as Record<INs, Worker>
   protected readonly queues = {} as Record<ONs, Queue>
   protected readonly events = {} as Record<ONs, QueueEvents>
@@ -156,7 +190,14 @@ export class TenantScheduler<
       })
       events.on('error', (error) => this.emit('error', error))
       const release = ({ jobId }: { jobId: string }) => {
-        this.slots?.release(`${name}:${jobId}`).catch((error) => this.emit('error', error))
+        this.slots
+          ?.release(`${name}:${jobId}`)
+          .then((released) => {
+            if (released) {
+              this.emit('released', { outputQueue: name, outputJobId: jobId })
+            }
+          })
+          .catch((error) => this.emit('error', error))
       }
       // 'failed' is emitted only when attempts are exhausted, retries keep the slot
       events.on('completed', release)
@@ -318,7 +359,9 @@ export class TenantScheduler<
     }
     if (reserved !== 'reserved') {
       const base = reserved === 'quota' ? this.options.quotaDelay ?? 1000 : this.options.capacityDelay ?? 500
-      await job.moveToDelayed(Date.now() + this.delayFor(base, inputName, job), token)
+      const delay = this.delayFor(base, inputName, job)
+      await job.moveToDelayed(Date.now() + delay, token)
+      this.emit('delayed', { tenant, inputQueue: inputName, outputQueue: outputName, jobId: job.id, reason: reserved === 'quota' ? 'quota' : 'capacity', delay })
       throw new DelayedError()
     }
 
@@ -338,6 +381,7 @@ export class TenantScheduler<
       const prepared = this.prepareJob({ name: job.name as JNs, data: job.data, opts })
       await queue.add(prepared.name, prepared.data, prepared.opts)
       await this.slots.confirm(tenant, key)
+      this.emit('dispatched', { tenant, inputQueue: inputName, outputQueue: outputName, jobId: job.id, outputJobId: jobId })
     } catch (error) {
       await this.slots.release(key).catch(() => undefined)
       throw error

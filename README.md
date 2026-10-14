@@ -35,6 +35,9 @@ const scheduler = new TenantScheduler(
 )
 
 scheduler.on('error', console.error)
+scheduler.on('delayed', (e) => logger.debug(e, 'job delayed'))     // e.reason: 'quota' | 'capacity'
+scheduler.on('dispatched', (e) => logger.debug(e, 'job dispatched'))
+scheduler.on('released', (e) => logger.debug(e, 'slot released'))
 await scheduler.waitUntilReady()
 scheduler.run()
 ```

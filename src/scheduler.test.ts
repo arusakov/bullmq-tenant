@@ -225,6 +225,31 @@ describe('TenantScheduler', () => {
     assert.ok((await first.inFlightOf('b')) <= 2)
   })
 
+  test('emits dispatched, delayed and released events', async () => {
+    const input = name('in')
+    const out = name('out')
+    const inQ = queue(input)
+    queue(out)
+
+    const s = await scheduler([input], { work: out }, { capacity: 10, quotas: { default: 1 }, quotaDelay: 50 })
+    const events: string[] = []
+    s.on('dispatched', (e) => events.push(`dispatched ${e.tenant} ${e.inputQueue}->${e.outputQueue}`))
+    s.on('delayed', (e) => events.push(`delayed ${e.tenant} ${e.reason}`))
+    s.on('released', (e) => events.push(`released ${e.outputQueue}`))
+
+    await inQ.addBulk([
+      { name: 'work', data: { tenantId: 'a' } },
+      { name: 'work', data: { tenantId: 'a' } },
+    ])
+    consumer(out, async () => undefined)
+
+    await until(() => events.filter((e) => e.startsWith('dispatched')).length === 2)
+    await until(() => events.filter((e) => e.startsWith('released')).length === 2)
+    assert.ok(events.includes(`dispatched a ${input}->${out}`))
+    assert.ok(events.includes('delayed a quota'))
+    assert.ok(events.includes(`released ${out}`))
+  })
+
   test('less urgent input queue retries later', async () => {
     const high = name('high')
     const low = name('low')
