@@ -29,6 +29,7 @@ export class Allocator<T> {
   private readonly pending = new Map<number, Map<string, AllocatorItem<T>[]>>()
   private readonly inFlightKeys = new Map<string, string>()
   private readonly inFlightByTenant = new Map<string, number>()
+  private readonly pendingByTenant = new Map<string, number>()
   private readonly lastServed = new Map<string, number>()
   private tick = 0
   private pendingCount = 0
@@ -47,6 +48,11 @@ export class Allocator<T> {
     return this.inFlightByTenant.get(tenant) ?? 0
   }
 
+  /** Pending + in flight items of the tenant. */
+  loadOf(tenant: string) {
+    return this.inFlightOf(tenant) + (this.pendingByTenant.get(tenant) ?? 0)
+  }
+
   push(item: AllocatorItem<T>) {
     let level = this.pending.get(item.priority)
     if (!level) {
@@ -60,6 +66,7 @@ export class Allocator<T> {
       level.set(item.tenant, [item])
     }
     this.pendingCount++
+    this.pendingByTenant.set(item.tenant, (this.pendingByTenant.get(item.tenant) ?? 0) + 1)
   }
 
   /** Takes the next item that may be started now and marks it as in flight. */
@@ -101,6 +108,7 @@ export class Allocator<T> {
         }
       }
       this.pendingCount--
+      this.decPending(best)
       this.markInFlight(item.key, item.tenant)
       this.lastServed.set(best, ++this.tick)
       return item
@@ -147,11 +155,21 @@ export class Allocator<T> {
       }
     }
     this.pending.clear()
+    this.pendingByTenant.clear()
     this.pendingCount = 0
     return items
   }
 
-  private quotaOf(tenant: string) {
+  private decPending(tenant: string) {
+    const left = (this.pendingByTenant.get(tenant) ?? 1) - 1
+    if (left > 0) {
+      this.pendingByTenant.set(tenant, left)
+    } else {
+      this.pendingByTenant.delete(tenant)
+    }
+  }
+
+  quotaOf(tenant: string) {
     return this.options.quota?.(tenant) ?? Infinity
   }
 

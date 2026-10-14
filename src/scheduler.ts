@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events'
 
 import {
+  DelayedError,
   Queue,
   QueueEvents,
   UnrecoverableError,
@@ -54,10 +55,16 @@ export type TenantSchedulerOptions<JN extends string = string> = {
   /** Extracts tenant id from a job. Default: `job.data.tenantId`. */
   tenantOf?: (job: Job<any, any, JN>) => string | number | undefined | null
   /**
-   * How many jobs per input queue the scheduler may hold in memory to choose
-   * from. Fairness is only guaranteed inside this window. Default: 500.
+   * How many jobs per input queue the scheduler may hold in memory.
+   * A tenant never has more than its quota of jobs here, so the window is
+   * not clogged by one tenant. Default: 500.
    */
   lookahead?: number
+  /**
+   * Delay (ms) before a job of a tenant that has used up its quota is
+   * retried: it goes back to the input queue as delayed. Default: 1000.
+   */
+  quotaDelay?: number
   /** Last chance to change a job before it is added to the output queue. */
   prepareJob?: (job: DefaultJob<JN>) => DefaultJob<JN>
 }
@@ -306,6 +313,16 @@ export class TenantScheduler<
       return job.moveToWait(token).then(() => {
         throw new WaitingError()
       })
+    }
+
+    // the tenant has used up its quota (in flight + buffered): do not hold
+    // the job in memory, retry it later, so other tenants stay visible
+    if (this.allocator.loadOf(tenant) >= this.allocator.quotaOf(tenant)) {
+      return job
+        .moveToDelayed(Date.now() + (this.options.quotaDelay ?? 1000), token)
+        .then(() => {
+          throw new DelayedError()
+        })
     }
 
     return new Promise<void>((resolve, reject) => {

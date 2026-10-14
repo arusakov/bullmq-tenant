@@ -153,7 +153,7 @@ describe('TenantScheduler', () => {
     const inQ = queue(input)
     const outQ = queue(out)
 
-    const s = await scheduler([input], { work: out }, { capacity: 10, quotas: { tenants: { a: 1 } } })
+    const s = await scheduler([input], { work: out }, { capacity: 10, quotas: { tenants: { a: 1 } }, quotaDelay: 100 })
 
     await inQ.addBulk([
       ...Array.from({ length: 3 }, () => ({ name: 'work', data: { tenantId: 'a' } })),
@@ -174,6 +174,29 @@ describe('TenantScheduler', () => {
     await until(() => done === 6)
   })
 
+  test('delays surplus jobs of a tenant so others are not hidden', async () => {
+    const input = name('in')
+    const out = name('out')
+    const inQ = queue(input)
+    const outQ = queue(out)
+
+    const s = await scheduler(
+      [input],
+      { work: out },
+      { capacity: 10, quotas: { default: 2 }, lookahead: 3, quotaDelay: 60_000 },
+    )
+
+    await inQ.addBulk([
+      ...Array.from({ length: 20 }, () => ({ name: 'work', data: { tenantId: 'a' } })),
+      { name: 'work', data: { tenantId: 'b' } },
+    ])
+
+    await until(async () => (await outQ.getWaitingCount()) === 3)
+    assert.equal(s.inFlightOf('a'), 2)
+    assert.equal(s.inFlightOf('b'), 1)
+    assert.equal(await inQ.getDelayedCount(), 18)
+  })
+
   test('processes more urgent input queue first', async () => {
     const high = name('high')
     const low = name('low')
@@ -188,7 +211,7 @@ describe('TenantScheduler', () => {
         { name: high, priority: 1 },
       ],
       { work: out },
-      { capacity: 1 },
+      { capacity: 1, quotas: { default: 10 } },
     )
 
     // occupy the only slot, then buffer low before high
@@ -235,7 +258,7 @@ describe('TenantScheduler', () => {
     const inQ = queue(input)
     queue(out)
 
-    const s = create([input], { work: out }, { capacity: 1 })
+    const s = create([input], { work: out }, { capacity: 1, quotas: { default: 10 } })
     await s.waitUntilReady()
     s.run()
 

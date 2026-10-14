@@ -11,6 +11,9 @@ input queues (by priority) ──► TenantScheduler ──► output queues (by
 - the output queue is chosen by job name (`nameToQueue`);
 - a job is moved to the output queue only when the system has free `capacity`
   (jobs waiting/active/delayed in output queues) and its tenant has free quota;
+- a tenant never has more than its quota of jobs in flight or buffered: surplus jobs are
+  returned to the input queue as delayed (`quotaDelay`, default 1s) and retried later,
+  so one tenant with thousands of jobs cannot hide the others;
 - between tenants the slots are shared fairly (the tenant with the fewest jobs in flight goes first).
 
 ```ts
@@ -39,6 +42,6 @@ tenant id (`data.tenantId` by default); jobs without tenant or route fail perman
 ## Notes
 
 - Delivery is at-least-once. The output job id is `<inputQueue>-<inputJobId>`, so a re-delivered input job is not duplicated.
-- Fairness is guaranteed inside the `lookahead` window (default 500 jobs per input queue).
+- `lookahead` (default 500 per input queue) only bounds the buffer; since a tenant holds at most its quota there, it should be at least the sum of quotas of concurrently active tenants.
 - `delay` of an input job is applied by the input queue and is not forwarded.
 - On start the scheduler counts jobs that are already in the output queues.
